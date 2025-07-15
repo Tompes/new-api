@@ -65,6 +65,15 @@ func Playground(c *gin.Context) {
 		return
 	}
 	middleware.SetupContextForSelectedChannel(c, channel, playgroundRequest.Model)
-	c.Set(constant.ContextKeyRequestStartTime, time.Now())
+	common.SetContextKey(c, constant.ContextKeyRequestStartTime, time.Now())
+
+	// Write user context to ensure acceptUnsetRatio is available
+	userId := c.GetInt("id")
+	userCache, err := model.GetUserCache(userId)
+	if err != nil {
+		openaiErr = service.OpenAIErrorWrapperLocal(err, "get_user_cache_failed", http.StatusInternalServerError)
+		return
+	}
+	userCache.WriteContext(c)
 	Relay(c)
 }
