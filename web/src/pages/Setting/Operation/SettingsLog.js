@@ -87,7 +87,7 @@ export default function SettingsLog(props) {
       }
     }
     currentInputs['historyTimestamp'] = inputs.historyTimestamp;
-    setInputs(Object.assign(inputs, currentInputs));
+    setInputs({...inputs, ...currentInputs});
     setInputsRow(structuredClone(currentInputs));
     refForm.current.setValues(currentInputs);
   }, [props.options]);
