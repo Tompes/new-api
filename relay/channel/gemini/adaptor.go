@@ -1,6 +1,7 @@
 package gemini
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,15 +22,42 @@ import (
 type Adaptor struct {
 }
 
-func (a *Adaptor) ConvertClaudeRequest(*gin.Context, *relaycommon.RelayInfo, *dto.ClaudeRequest) (any, error) {
-	//TODO implement me
-	panic("implement me")
-	return nil, nil
+func (a *Adaptor) ConvertClaudeRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.ClaudeRequest) (any, error) {
+	geminiRequest, err := ConvertClaudeRequest(request)
+	if err != nil {
+		return nil, err
+	}
+	return geminiRequest, nil
 }
 
 func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.AudioRequest) (io.Reader, error) {
-	//TODO implement me
-	return nil, errors.New("not implemented")
+	format, base64String, err := service.DecodeBase64FileData(request.Input)
+	if err != nil {
+		return nil, fmt.Errorf("decode base64 audio data failed: %s", err.Error())
+	}
+
+	geminiRequest := GeminiChatRequest{
+		Contents: []GeminiChatContent{
+			{
+				Role: "user",
+				Parts: []GeminiPart{
+					{
+						InlineData: &GeminiInlineData{
+							MimeType: "audio/" + format,
+							Data:     base64String,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	jsonData, err := json.Marshal(geminiRequest)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling gemini audio request: %w", err)
+	}
+
+	return bytes.NewReader(jsonData), nil
 }
 
 func (a *Adaptor) ConvertImageRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.ImageRequest) (any, error) {
@@ -160,8 +188,126 @@ func (a *Adaptor) ConvertEmbeddingRequest(c *gin.Context, info *relaycommon.Rela
 }
 
 func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, request dto.OpenAIResponsesRequest) (any, error) {
-	// TODO implement me
-	return nil, errors.New("not implemented")
+	geminiRequest := &GeminiChatRequest{
+		Contents: []GeminiChatContent{},
+		GenerationConfig: GeminiChatGenerationConfig{
+			Temperature:     &request.Temperature,
+			TopP:            request.TopP,
+			MaxOutputTokens: request.MaxOutputTokens,
+		},
+	}
+
+	if request.Instructions != nil {
+		var instructions string
+		if err := json.Unmarshal(request.Instructions, &instructions); err == nil {
+			geminiRequest.SystemInstructions = &GeminiChatContent{
+				Parts: []GeminiPart{
+					{
+						Text: instructions,
+					},
+				},
+			}
+		}
+	}
+
+	if request.Input != nil {
+		var inputMessages []dto.Message
+		if err := json.Unmarshal(request.Input, &inputMessages); err == nil {
+			for _, message := range inputMessages {
+				geminiContent, err := openAIMessageToGeminiContent(message)
+				if err != nil {
+					return nil, err
+				}
+				geminiRequest.Contents = append(geminiRequest.Contents, *geminiContent)
+			}
+		}
+	}
+
+	for _, tool := range request.Tools {
+		if tool.Type == "web_search" {
+			geminiRequest.Tools = append(geminiRequest.Tools, GeminiChatTool{
+				GoogleSearch: make(map[string]string),
+			})
+		}
+		// Simplified function tool handling
+		if tool.Type == "function" && tool.Function != nil {
+			var function dto.FunctionRequest
+			if err := json.Unmarshal(tool.Function, &function); err == nil {
+				geminiRequest.Tools = append(geminiRequest.Tools, GeminiChatTool{
+					FunctionDeclarations: []dto.FunctionRequest{function},
+				})
+			}
+		}
+	}
+
+	return geminiRequest, nil
+}
+
+func openAIMessageToGeminiContent(message dto.Message) (*GeminiChatContent, error) {
+	role := message.Role
+	if role == "assistant" {
+		role = "model"
+	}
+
+	content := &GeminiChatContent{
+		Role: role,
+	}
+
+	parts, err := openAIMessageContentToGeminiParts(message.Content)
+	if err != nil {
+		return nil, err
+	}
+	content.Parts = parts
+
+	return content, nil
+}
+
+func openAIMessageContentToGeminiParts(content_any any) ([]GeminiPart, error) {
+	var parts []GeminiPart
+
+	content, ok := content_any.(string)
+	if ok {
+		parts = append(parts, GeminiPart{Text: content})
+		return parts, nil
+	}
+
+	mediaContents, ok := content_any.([]any)
+	if !ok {
+		return nil, fmt.Errorf("unsupported message content format")
+	}
+
+	for _, mediaContent := range mediaContents {
+		mediaMap, ok := mediaContent.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		switch mediaMap["type"] {
+		case "text":
+			parts = append(parts, GeminiPart{Text: mediaMap["text"].(string)})
+		case "image_url":
+			imageUrl, _ := mediaMap["image_url"].(map[string]any)
+			url := imageUrl["url"].(string)
+			format, base64, err := service.DecodeBase64FileData(url)
+			if err != nil {
+				// assume it is a url
+				fileData, err := service.GetFileBase64FromUrl(url)
+				if err != nil {
+					return nil, err
+				}
+				format = fileData.MimeType
+				base64 = fileData.Base64Data
+			}
+			parts = append(parts, GeminiPart{
+				InlineData: &GeminiInlineData{
+					MimeType: format,
+					Data:     base64,
+				},
+			})
+		}
+	}
+
+	return parts, nil
 }
 
 func (a *Adaptor) DoRequest(c *gin.Context, info *relaycommon.RelayInfo, requestBody io.Reader) (any, error) {

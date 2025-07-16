@@ -861,6 +861,99 @@ func GeminiChatStreamHandler(c *gin.Context, resp *http.Response, info *relaycom
 	return nil, usage
 }
 
+func ConvertClaudeRequest(claudeRequest *dto.ClaudeRequest) (*GeminiChatRequest, error) {
+	geminiRequest := &GeminiChatRequest{
+		Contents: make([]GeminiChatContent, 0, len(claudeRequest.Messages)),
+		GenerationConfig: GeminiChatGenerationConfig{
+			Temperature:     claudeRequest.Temperature,
+			TopP:            claudeRequest.TopP,
+			TopK:            claudeRequest.TopK,
+			MaxOutputTokens: claudeRequest.MaxTokensToSample,
+		},
+		SafetySettings: make([]GeminiChatSafetySettings, 0, len(SafetySettingList)),
+	}
+
+	for _, category := range SafetySettingList {
+		geminiRequest.SafetySettings = append(geminiRequest.SafetySettings, GeminiChatSafetySettings{
+			Category:  category,
+			Threshold: model_setting.GetGeminiSafetySetting(category),
+		})
+	}
+
+	if claudeRequest.System != "" {
+		geminiRequest.SystemInstructions = &GeminiChatContent{
+			Parts: []GeminiPart{
+				{
+					Text: claudeRequest.GetStringSystem(),
+				},
+			},
+		}
+	}
+
+	for _, claudeMessage := range claudeRequest.Messages {
+		geminiContent, err := claudeMessageToGeminiContent(claudeMessage)
+		if err != nil {
+			return nil, err
+		}
+		geminiRequest.Contents = append(geminiRequest.Contents, *geminiContent)
+	}
+
+	return geminiRequest, nil
+}
+
+func claudeMessageToGeminiContent(claudeMessage dto.ClaudeMessage) (*GeminiChatContent, error) {
+	geminiContent := &GeminiChatContent{
+		Role: claudeMessage.Role,
+	}
+
+	if claudeMessage.Role == "assistant" {
+		geminiContent.Role = "model"
+	}
+
+	content, err := claudeMessage.ParseContent()
+	if err != nil {
+		// Not content that can be parsed, probably a string.
+		geminiContent.Parts = []GeminiPart{
+			{
+				Text: claudeMessage.GetStringContent(),
+			},
+		}
+		return geminiContent, nil
+	}
+
+	for _, claudePart := range content {
+		geminiPart, err := claudePartToGeminiPart(claudePart)
+		if err != nil {
+			return nil, err
+		}
+		geminiContent.Parts = append(geminiContent.Parts, *geminiPart)
+	}
+
+	return geminiContent, nil
+}
+
+func claudePartToGeminiPart(claudePart dto.ClaudeMediaMessage) (*GeminiPart, error) {
+	geminiPart := &GeminiPart{}
+
+	switch claudePart.Type {
+	case "text":
+		geminiPart.Text = claudePart.GetText()
+	case "image":
+		format, base64String, err := service.DecodeBase64FileData(claudePart.Source.Data.(string))
+		if err != nil {
+			return nil, fmt.Errorf("decode base64 image data failed: %s", err.Error())
+		}
+		geminiPart.InlineData = &GeminiInlineData{
+			MimeType: format,
+			Data:     base64String,
+		}
+	default:
+		return nil, fmt.Errorf("unsupported claude part type: %s", claudePart.Type)
+	}
+
+	return geminiPart, nil
+}
+
 func GeminiChatHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.OpenAIErrorWithStatusCode, *dto.Usage) {
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
