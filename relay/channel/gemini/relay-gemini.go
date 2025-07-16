@@ -939,13 +939,39 @@ func claudePartToGeminiPart(claudePart dto.ClaudeMediaMessage) (*GeminiPart, err
 	case "text":
 		geminiPart.Text = claudePart.GetText()
 	case "image":
-		format, base64String, err := service.DecodeBase64FileData(claudePart.Source.Data.(string))
-		if err != nil {
-			return nil, fmt.Errorf("decode base64 image data failed: %s", err.Error())
+		// 检查数据类型
+		dataStr, ok := claudePart.Source.Data.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid image data type")
 		}
-		geminiPart.InlineData = &GeminiInlineData{
-			MimeType: format,
-			Data:     base64String,
+
+		// 判断是 URL 还是 base64
+		if strings.HasPrefix(dataStr, "http://") || strings.HasPrefix(dataStr, "https://") {
+			// 处理 URL 格式的图片
+			fileData, err := service.GetFileBase64FromUrl(dataStr)
+			if err != nil {
+				return nil, fmt.Errorf("get file base64 from url '%s' failed: %w", dataStr, err)
+			}
+
+			// 验证 MIME 类型是否被 Gemini 支持
+			if _, ok := geminiSupportedMimeTypes[strings.ToLower(fileData.MimeType)]; !ok {
+				return nil, fmt.Errorf("mime type is not supported by Gemini: '%s', supported types are: %v", fileData.MimeType, getSupportedMimeTypesList())
+			}
+
+			geminiPart.InlineData = &GeminiInlineData{
+				MimeType: fileData.MimeType,
+				Data:     fileData.Base64Data,
+			}
+		} else {
+			// 处理 base64 格式的图片
+			format, base64String, err := service.DecodeBase64FileData(dataStr)
+			if err != nil {
+				return nil, fmt.Errorf("decode base64 image data failed: %s", err.Error())
+			}
+			geminiPart.InlineData = &GeminiInlineData{
+				MimeType: format,
+				Data:     base64String,
+			}
 		}
 	default:
 		return nil, fmt.Errorf("unsupported claude part type: %s", claudePart.Type)

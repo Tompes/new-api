@@ -36,6 +36,22 @@ func (a *Adaptor) ConvertAudioRequest(c *gin.Context, info *relaycommon.RelayInf
 		return nil, fmt.Errorf("decode base64 audio data failed: %s", err.Error())
 	}
 
+	// 验证音频格式是否被支持
+	supportedAudioFormats := map[string]bool{
+		"mpeg": true,
+		"mp3":  true,
+		"wav":  true,
+		"aac":  true,
+		"flac": true,
+		"webm": true,
+		"pcm":  true,
+		"mpga": true,
+	}
+
+	if !supportedAudioFormats[format] {
+		return nil, fmt.Errorf("unsupported audio format: %s, supported formats are: mpeg, mp3, wav", format)
+	}
+
 	geminiRequest := GeminiChatRequest{
 		Contents: []GeminiChatContent{
 			{
@@ -284,16 +300,30 @@ func openAIMessageContentToGeminiParts(content_any any) ([]GeminiPart, error) {
 
 		switch mediaMap["type"] {
 		case "text":
-			parts = append(parts, GeminiPart{Text: mediaMap["text"].(string)})
+			text, ok := mediaMap["text"].(string)
+			if !ok {
+				continue
+			}
+			parts = append(parts, GeminiPart{Text: text})
 		case "image_url":
-			imageUrl, _ := mediaMap["image_url"].(map[string]any)
-			url := imageUrl["url"].(string)
+			imageUrl, ok := mediaMap["image_url"].(map[string]any)
+			if !ok {
+				continue
+			}
+			url, ok := imageUrl["url"].(string)
+			if !ok {
+				continue
+			}
 			format, base64, err := service.DecodeBase64FileData(url)
 			if err != nil {
 				// assume it is a url
 				fileData, err := service.GetFileBase64FromUrl(url)
 				if err != nil {
 					return nil, err
+				}
+				// 验证 MIME 类型是否被 Gemini 支持
+				if _, ok := geminiSupportedMimeTypes[strings.ToLower(fileData.MimeType)]; !ok {
+					return nil, fmt.Errorf("mime type is not supported by Gemini: '%s', supported types are: %v", fileData.MimeType, getSupportedMimeTypesList())
 				}
 				format = fileData.MimeType
 				base64 = fileData.Base64Data
