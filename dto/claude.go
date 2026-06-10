@@ -24,7 +24,7 @@ type ClaudeMediaMessage struct {
 	StopReason   *string              `json:"stop_reason,omitempty"`
 	PartialJson  *string              `json:"partial_json,omitempty"`
 	Role         string               `json:"role,omitempty"`
-	Thinking     string               `json:"thinking,omitempty"`
+	Thinking     *string              `json:"thinking,omitempty"`
 	Signature    string               `json:"signature,omitempty"`
 	Delta        string               `json:"delta,omitempty"`
 	CacheControl json.RawMessage      `json:"cache_control,omitempty"`
@@ -98,6 +98,20 @@ func (c *ClaudeMediaMessage) ParseMediaContent() []ClaudeMediaMessage {
 	return mediaContent
 }
 
+func (m *ClaudeMediaMessage) ToFileSource() types.FileSource {
+	if m.Source == nil {
+		return nil
+	}
+	data := m.Source.Url
+	if data == "" {
+		data = common.Interface2String(m.Source.Data)
+	}
+	if data == "" {
+		return nil
+	}
+	return types.NewFileSourceFromData(data, m.Source.MediaType)
+}
+
 type ClaudeMessageSource struct {
 	Type      string `json:"type"`
 	MediaType string `json:"media_type,omitempty"`
@@ -148,6 +162,10 @@ func (c *ClaudeMessage) SetStringContent(content string) {
 	c.Content = content
 }
 
+func (c *ClaudeMessage) SetContent(content any) {
+	c.Content = content
+}
+
 func (c *ClaudeMessage) ParseContent() ([]ClaudeMediaMessage, error) {
 	return common.Any2Type[[]ClaudeMediaMessage](c.Content)
 }
@@ -186,31 +204,51 @@ type ClaudeToolChoice struct {
 }
 
 type ClaudeRequest struct {
-	Model             string          `json:"model"`
-	Prompt            string          `json:"prompt,omitempty"`
-	System            any             `json:"system,omitempty"`
-	Messages          []ClaudeMessage `json:"messages,omitempty"`
-	MaxTokens         uint            `json:"max_tokens,omitempty"`
-	MaxTokensToSample uint            `json:"max_tokens_to_sample,omitempty"`
+	Model        string          `json:"model"`
+	Prompt       string          `json:"prompt,omitempty"`
+	System       any             `json:"system,omitempty"`
+	Messages     []ClaudeMessage `json:"messages,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+	// InferenceGeo controls Claude data residency region.
+	// This field is filtered by default and can be enabled via channel setting allow_inference_geo.
+	InferenceGeo      string          `json:"inference_geo,omitempty"`
+	MaxTokens         *uint           `json:"max_tokens,omitempty"`
+	MaxTokensToSample *uint           `json:"max_tokens_to_sample,omitempty"`
 	StopSequences     []string        `json:"stop_sequences,omitempty"`
 	Temperature       *float64        `json:"temperature,omitempty"`
-	TopP              float64         `json:"top_p,omitempty"`
-	TopK              int             `json:"top_k,omitempty"`
-	Stream            bool            `json:"stream,omitempty"`
+	TopP              *float64        `json:"top_p,omitempty"`
+	TopK              *int            `json:"top_k,omitempty"`
+	Stream            *bool           `json:"stream,omitempty"`
 	Tools             any             `json:"tools,omitempty"`
 	ContextManagement json.RawMessage `json:"context_management,omitempty"`
+	OutputConfig      json.RawMessage `json:"output_config,omitempty"`
+	OutputFormat      json.RawMessage `json:"output_format,omitempty"`
+	Container         json.RawMessage `json:"container,omitempty"`
 	ToolChoice        any             `json:"tool_choice,omitempty"`
 	Thinking          *Thinking       `json:"thinking,omitempty"`
 	McpServers        json.RawMessage `json:"mcp_servers,omitempty"`
 	Metadata          json.RawMessage `json:"metadata,omitempty"`
-	// 服务层级字段，用于指定 API 服务等级。允许透传可能导致实际计费高于预期，默认应过滤
+	// Speed specifies the Claude inference speed mode.
+	// This field is filtered by default and can be enabled via channel setting allow_speed.
+	Speed json.RawMessage `json:"speed,omitempty"`
+	// ServiceTier specifies upstream service level and may affect billing.
+	// This field is filtered by default and can be enabled via channel setting allow_service_tier.
 	ServiceTier string `json:"service_tier,omitempty"`
 }
 
+// OutputConfigForEffort just for extract effort
+type OutputConfigForEffort struct {
+	Effort string `json:"effort,omitempty"`
+}
+
 func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
+	maxTokens := 0
+	if c.MaxTokens != nil {
+		maxTokens = int(*c.MaxTokens)
+	}
 	var tokenCountMeta = types.TokenCountMeta{
 		TokenType: types.TokenTypeTokenizer,
-		MaxTokens: int(c.MaxTokens),
+		MaxTokens: maxTokens,
 	}
 
 	var texts = make([]string, 0)
@@ -230,14 +268,11 @@ func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
 				case "text":
 					texts = append(texts, media.GetText())
 				case "image":
-					if media.Source != nil {
-						data := media.Source.Url
-						if data == "" {
-							data = common.Interface2String(media.Source.Data)
-						}
-						if data != "" {
-							fileMeta = append(fileMeta, &types.FileMeta{FileType: types.FileTypeImage, OriginData: data})
-						}
+					if source := media.ToFileSource(); source != nil {
+						fileMeta = append(fileMeta, &types.FileMeta{
+							FileType: types.FileTypeImage,
+							Source:   source,
+						})
 					}
 				}
 			}
@@ -262,14 +297,11 @@ func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
 			case "text":
 				texts = append(texts, media.GetText())
 			case "image":
-				if media.Source != nil {
-					data := media.Source.Url
-					if data == "" {
-						data = common.Interface2String(media.Source.Data)
-					}
-					if data != "" {
-						fileMeta = append(fileMeta, &types.FileMeta{FileType: types.FileTypeImage, OriginData: data})
-					}
+				if source := media.ToFileSource(); source != nil {
+					fileMeta = append(fileMeta, &types.FileMeta{
+						FileType: types.FileTypeImage,
+						Source:   source,
+					})
 				}
 			case "tool_use":
 				if media.Name != "" {
@@ -327,7 +359,10 @@ func (c *ClaudeRequest) GetTokenCountMeta() *types.TokenCountMeta {
 }
 
 func (c *ClaudeRequest) IsStream(ctx *gin.Context) bool {
-	return c.Stream
+	if c.Stream == nil {
+		return false
+	}
+	return *c.Stream
 }
 
 func (c *ClaudeRequest) SetModelName(modelName string) {
@@ -377,6 +412,15 @@ func (c *ClaudeRequest) GetTools() []any {
 	}
 }
 
+func (c *ClaudeRequest) GetEfforts() string {
+	var OutputConfig OutputConfigForEffort
+	if err := json.Unmarshal(c.OutputConfig, &OutputConfig); err == nil {
+		effort := OutputConfig.Effort
+		return effort
+	}
+	return ""
+}
+
 // ProcessTools 处理工具列表，支持类型断言
 func ProcessTools(tools []any) ([]*Tool, []*ClaudeWebSearchTool) {
 	var normalTools []*Tool
@@ -402,8 +446,13 @@ func ProcessTools(tools []any) ([]*Tool, []*ClaudeWebSearchTool) {
 }
 
 type Thinking struct {
-	Type         string `json:"type"`
+	Type         string `json:"type,omitempty"`
 	BudgetTokens *int   `json:"budget_tokens,omitempty"`
+	// Display controls whether thinking content is returned in the response.
+	// Used with adaptive thinking on Claude Opus 4.7+: "summarized" restores
+	// the visible summary that was default on Opus 4.6; "omitted" (default on
+	// 4.7) suppresses it. Pass-through field from upstream Anthropic API.
+	Display string `json:"display,omitempty"`
 }
 
 func (c *Thinking) GetBudgetTokens() int {
@@ -506,11 +555,44 @@ func (c *ClaudeResponse) GetClaudeError() *types.ClaudeError {
 }
 
 type ClaudeUsage struct {
-	InputTokens              int                  `json:"input_tokens"`
-	CacheCreationInputTokens int                  `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     int                  `json:"cache_read_input_tokens"`
-	OutputTokens             int                  `json:"output_tokens"`
-	ServerToolUse            *ClaudeServerToolUse `json:"server_tool_use,omitempty"`
+	InputTokens              int                       `json:"input_tokens"`
+	CacheCreationInputTokens int                       `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int                       `json:"cache_read_input_tokens"`
+	OutputTokens             int                       `json:"output_tokens"`
+	CacheCreation            *ClaudeCacheCreationUsage `json:"cache_creation,omitempty"`
+	// claude cache 1h
+	ClaudeCacheCreation5mTokens int                  `json:"claude_cache_creation_5_m_tokens"`
+	ClaudeCacheCreation1hTokens int                  `json:"claude_cache_creation_1_h_tokens"`
+	ServerToolUse               *ClaudeServerToolUse `json:"server_tool_use,omitempty"`
+}
+
+type ClaudeCacheCreationUsage struct {
+	Ephemeral5mInputTokens int `json:"ephemeral_5m_input_tokens,omitempty"`
+	Ephemeral1hInputTokens int `json:"ephemeral_1h_input_tokens,omitempty"`
+}
+
+func (u *ClaudeUsage) GetCacheCreation5mTokens() int {
+	if u == nil || u.CacheCreation == nil {
+		return 0
+	}
+	return u.CacheCreation.Ephemeral5mInputTokens
+}
+
+func (u *ClaudeUsage) GetCacheCreation1hTokens() int {
+	if u == nil || u.CacheCreation == nil {
+		return 0
+	}
+	return u.CacheCreation.Ephemeral1hInputTokens
+}
+
+func (u *ClaudeUsage) GetCacheCreationTotalTokens() int {
+	if u == nil {
+		return 0
+	}
+	if u.CacheCreationInputTokens > 0 {
+		return u.CacheCreationInputTokens
+	}
+	return u.GetCacheCreation5mTokens() + u.GetCacheCreation1hTokens()
 }
 
 type ClaudeServerToolUse struct {

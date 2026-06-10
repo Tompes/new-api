@@ -52,6 +52,7 @@ func updateVideoTaskAll(ctx context.Context, platform constant.TaskPlatform, cha
 	info.ChannelMeta = &relaycommon.ChannelMeta{
 		ChannelBaseUrl: cacheGetChannel.GetBaseURL(),
 	}
+	info.ApiKey = cacheGetChannel.Key
 	adaptor.Init(info)
 	for _, taskId := range taskIds {
 		if err := updateVideoSingleTask(ctx, adaptor, cacheGetChannel, taskId, taskM); err != nil {
@@ -66,16 +67,23 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 	if channel.GetBaseURL() != "" {
 		baseURL = channel.GetBaseURL()
 	}
+	proxy := channel.GetSetting().Proxy
 
 	task := taskM[taskId]
 	if task == nil {
 		logger.LogError(ctx, fmt.Sprintf("Task %s not found in taskM", taskId))
 		return fmt.Errorf("task %s not found", taskId)
 	}
-	resp, err := adaptor.FetchTask(baseURL, channel.Key, map[string]any{
+	key := channel.Key
+
+	privateData := task.PrivateData
+	if privateData.Key != "" {
+		key = privateData.Key
+	}
+	resp, err := adaptor.FetchTask(baseURL, key, map[string]any{
 		"task_id": taskId,
 		"action":  task.Action,
-	})
+	}, proxy)
 	if err != nil {
 		return fmt.Errorf("fetchTask failed for task %s: %w", taskId, err)
 	}
@@ -88,10 +96,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 		return fmt.Errorf("readAll failed for task %s: %w", taskId, err)
 	}
 
+	logger.LogDebug(ctx, "UpdateVideoSingleTask response: %s", responseBody)
+
 	taskResult := &relaycommon.TaskInfo{}
 	// try parse as New API response format
 	var responseItems dto.TaskResponse[model.Task]
-	if err = json.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
+	if err = common.Unmarshal(responseBody, &responseItems); err == nil && responseItems.IsSuccess() {
+		logger.LogDebug(ctx, "UpdateVideoSingleTask parsed as new api response format: %+v", responseItems)
 		t := responseItems.Data
 		taskResult.TaskID = t.TaskID
 		taskResult.Status = string(t.Status)
@@ -105,10 +116,19 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 		task.Data = redactVideoResponseBody(responseBody)
 	}
 
+	logger.LogDebug(ctx, "UpdateVideoSingleTask taskResult: %+v", taskResult)
+
 	now := time.Now().Unix()
 	if taskResult.Status == "" {
-		return fmt.Errorf("task %s status is empty", taskId)
+		//return fmt.Errorf("task %s status is empty", taskId)
+		taskResult = relaycommon.FailTaskInfo("upstream returned empty status")
 	}
+
+	// 记录原本的状态，防止重复退款
+	shouldRefund := false
+	quota := task.Quota
+	preStatus := task.Status
+
 	task.Status = model.TaskStatus(taskResult.Status)
 	switch taskResult.Status {
 	case model.TaskStatusSubmitted:
@@ -137,14 +157,19 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 				if modelName, ok := taskData["model"].(string); ok && modelName != "" {
 					// 获取模型价格和倍率
 					modelRatio, hasRatioSetting, _ := ratio_setting.GetModelRatio(modelName)
-
 					// 只有配置了倍率(非固定价格)时才按 token 重新计费
 					if hasRatioSetting && modelRatio > 0 {
 						// 获取用户和组的倍率信息
-						user, err := model.GetUserById(task.UserId, false)
-						if err == nil {
-							groupRatio := ratio_setting.GetGroupRatio(user.Group)
-							userGroupRatio, hasUserGroupRatio := ratio_setting.GetGroupGroupRatio(user.Group, user.Group)
+						group := task.Group
+						if group == "" {
+							user, err := model.GetUserById(task.UserId, false)
+							if err == nil {
+								group = user.Group
+							}
+						}
+						if group != "" {
+							groupRatio := ratio_setting.GetGroupRatio(group)
+							userGroupRatio, hasUserGroupRatio := ratio_setting.GetGroupGroupRatio(group, group)
 
 							var finalGroupRatio float64
 							if hasUserGroupRatio {
@@ -169,7 +194,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 									logger.LogQuota(preConsumedQuota),
 									taskResult.TotalTokens,
 								))
-								if err := model.DecreaseUserQuota(task.UserId, quotaDelta); err != nil {
+								if err := model.DecreaseUserQuota(task.UserId, quotaDelta, false); err != nil {
 									logger.LogError(ctx, fmt.Sprintf("补扣费失败: %s", err.Error()))
 								} else {
 									model.UpdateUserUsedQuotaAndRequestCount(task.UserId, quotaDelta)
@@ -214,6 +239,7 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 			}
 		}
 	case model.TaskStatusFailure:
+		logger.LogJson(ctx, fmt.Sprintf("Task %s failed", taskId), task)
 		task.Status = model.TaskStatusFailure
 		task.Progress = "100%"
 		if task.FinishTime == 0 {
@@ -221,13 +247,13 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 		}
 		task.FailReason = taskResult.Reason
 		logger.LogInfo(ctx, fmt.Sprintf("Task %s failed: %s", task.TaskID, task.FailReason))
-		quota := task.Quota
+		taskResult.Progress = "100%"
 		if quota != 0 {
-			if err := model.IncreaseUserQuota(task.UserId, quota, false); err != nil {
-				logger.LogError(ctx, "Failed to increase user quota: "+err.Error())
+			if preStatus != model.TaskStatusFailure {
+				shouldRefund = true
+			} else {
+				logger.LogWarn(ctx, fmt.Sprintf("Task %s already in failure status, skip refund", task.TaskID))
 			}
-			logContent := fmt.Sprintf("Video async task failed %s, refund %s", task.TaskID, logger.LogQuota(quota))
-			model.RecordLog(task.UserId, model.LogTypeSystem, logContent)
 		}
 	default:
 		return fmt.Errorf("unknown task status %s for task %s", taskResult.Status, taskId)
@@ -237,6 +263,16 @@ func updateVideoSingleTask(ctx context.Context, adaptor channel.TaskAdaptor, cha
 	}
 	if err := task.Update(); err != nil {
 		common.SysLog("UpdateVideoTask task error: " + err.Error())
+		shouldRefund = false
+	}
+
+	if shouldRefund {
+		// 任务失败且之前状态不是失败才退还额度，防止重复退还
+		if err := model.IncreaseUserQuota(task.UserId, quota, false); err != nil {
+			logger.LogWarn(ctx, "Failed to increase user quota: "+err.Error())
+		}
+		logContent := fmt.Sprintf("Video async task failed %s, refund %s", task.TaskID, logger.LogQuota(quota))
+		model.RecordLog(task.UserId, model.LogTypeSystem, logContent)
 	}
 
 	return nil

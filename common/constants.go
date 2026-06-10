@@ -1,9 +1,12 @@
 package common
 
 import (
+	"crypto/tls"
 	//"os"
 	//"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -15,6 +18,44 @@ var SystemName = "New API"
 var Footer = ""
 var Logo = ""
 var TopUpLink = ""
+
+var themeValue atomic.Value // stores string; safe for concurrent read/write
+
+func init() {
+	themeValue.Store("classic")
+}
+
+func GetTheme() string {
+	return themeValue.Load().(string)
+}
+
+// SetTheme updates the frontend theme atomically.
+// Only "default" and "classic" are accepted; other values are silently ignored.
+func SetTheme(t string) {
+	if t == "default" || t == "classic" {
+		themeValue.Store(t)
+	}
+}
+
+// ThemeAwarePath rewrites legacy /console/* paths to the default-theme
+// equivalents when the active theme is "default".  For "classic" (or any
+// other theme) the path is returned unchanged.  The function only touches
+// known prefixes so it is safe to call with arbitrary suffixes and query
+// strings.
+func ThemeAwarePath(suffix string) string {
+	if GetTheme() != "default" {
+		return suffix
+	}
+	switch {
+	case strings.HasPrefix(suffix, "/console/topup"):
+		return strings.Replace(suffix, "/console/topup", "/wallet", 1)
+	case strings.HasPrefix(suffix, "/console/log"):
+		return strings.Replace(suffix, "/console/log", "/usage-logs", 1)
+	case strings.HasPrefix(suffix, "/console/personal"):
+		return strings.Replace(suffix, "/console/personal", "/profile", 1)
+	}
+	return suffix
+}
 
 // var ChatLink = ""
 // var ChatLink2 = ""
@@ -38,7 +79,7 @@ var OptionMap map[string]string
 var OptionMapRWMutex sync.RWMutex
 
 var ItemsPerPage = 10
-var MaxRecentItems = 100
+var MaxRecentItems = 1000
 
 var PasswordLoginEnabled = true
 var PasswordRegisterEnabled = true
@@ -73,9 +114,13 @@ var MemoryCacheEnabled bool
 
 var LogConsumeEnabled = true
 
+var TLSInsecureSkipVerify bool
+var InsecureTLSConfig = &tls.Config{InsecureSkipVerify: true}
+
 var SMTPServer = ""
 var SMTPPort = 587
 var SMTPSSLEnabled = false
+var SMTPForceAuthLogin = false
 var SMTPAccount = ""
 var SMTPFrom = ""
 var SMTPToken = ""
@@ -111,6 +156,10 @@ var RetryTimes = 0
 
 var IsMasterNode bool
 
+// NodeName 节点名称，从 NODE_NAME 环境变量读取；
+// 用于审计日志中标识节点身份，在容器/K8s 部署时比自动探测到的容器内网 IP 更具可读性。
+var NodeName = ""
+
 var requestInterval int
 var RequestInterval time.Duration
 
@@ -121,13 +170,18 @@ var BatchUpdateInterval int
 
 var RelayTimeout int // unit is second
 
+var RelayIdleConnTimeout int // unit is second
+var RelayMaxIdleConns int
+var RelayMaxIdleConnsPerHost int
+
 var GeminiSafetySetting string
 
 // https://docs.cohere.com/docs/safety-modes Type; NONE/CONTEXTUAL/STRICT
 var CohereSafetySetting string
 
 const (
-	RequestIdKey = "X-Oneapi-Request-Id"
+	RequestIdKey         = "X-Oneapi-Request-Id"
+	UpstreamRequestIdKey = "X-Upstream-Request-Id"
 )
 
 const (
@@ -159,14 +213,20 @@ var (
 	GlobalWebRateLimitNum      int
 	GlobalWebRateLimitDuration int64
 
+	CriticalRateLimitEnable   bool
+	CriticalRateLimitNum            = 20
+	CriticalRateLimitDuration int64 = 20 * 60
+
 	UploadRateLimitNum            = 10
 	UploadRateLimitDuration int64 = 60
 
 	DownloadRateLimitNum            = 10
 	DownloadRateLimitDuration int64 = 60
 
-	CriticalRateLimitNum            = 20
-	CriticalRateLimitDuration int64 = 20 * 60
+	// Per-user search rate limit (applies after authentication, keyed by user ID)
+	SearchRateLimitEnable         = true
+	SearchRateLimitNum            = 10
+	SearchRateLimitDuration int64 = 60
 )
 
 var RateLimitKeyExpirationDuration = 20 * time.Minute
@@ -199,5 +259,6 @@ const (
 const (
 	TopUpStatusPending = "pending"
 	TopUpStatusSuccess = "success"
+	TopUpStatusFailed  = "failed"
 	TopUpStatusExpired = "expired"
 )

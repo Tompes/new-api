@@ -1,21 +1,27 @@
 package aws
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
+	"github.com/QuantumNous/new-api/relay/channel"
 	"github.com/QuantumNous/new-api/relay/channel/claude"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/relay/helper"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/types"
 
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
@@ -23,7 +29,38 @@ import (
 	"github.com/aws/smithy-go/auth/bearer"
 )
 
+// getAwsErrorStatusCode extracts HTTP status code from AWS SDK error
+func getAwsErrorStatusCode(err error) int {
+	// Check for HTTP response error which contains status code
+	var httpErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &httpErr) {
+		return httpErr.HTTPStatusCode()
+	}
+	// Default to 500 if we can't determine the status code
+	return http.StatusInternalServerError
+}
+
+func newAwsInvokeContext() (context.Context, context.CancelFunc) {
+	if common.RelayTimeout <= 0 {
+		return context.Background(), func() {}
+	}
+	return context.WithTimeout(context.Background(), time.Duration(common.RelayTimeout)*time.Second)
+}
+
 func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.Client, error) {
+	var (
+		httpClient *http.Client
+		err        error
+	)
+	if info.ChannelSetting.Proxy != "" {
+		httpClient, err = service.NewProxyHttpClient(info.ChannelSetting.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("new proxy http client failed: %w", err)
+		}
+	} else {
+		httpClient = service.GetHttpClient()
+	}
+
 	awsSecret := strings.Split(info.ApiKey, "|")
 	var client *bedrockruntime.Client
 	switch len(awsSecret) {
@@ -33,6 +70,7 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 		client = bedrockruntime.New(bedrockruntime.Options{
 			Region:                  region,
 			BearerAuthTokenProvider: bearer.StaticTokenProvider{Token: bearer.Token{Value: apiKey}},
+			HTTPClient:              httpClient,
 		})
 	case 3:
 		ak := awsSecret[0]
@@ -41,6 +79,7 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 		client = bedrockruntime.New(bedrockruntime.Options{
 			Region:      region,
 			Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(ak, sk, "")),
+			HTTPClient:  httpClient,
 		})
 	default:
 		return nil, errors.New("invalid aws secret key")
@@ -49,16 +88,111 @@ func newAwsClient(c *gin.Context, info *relaycommon.RelayInfo) (*bedrockruntime.
 	return client, nil
 }
 
-func wrapErr(err error) *dto.OpenAIErrorWithStatusCode {
-	return &dto.OpenAIErrorWithStatusCode{
-		StatusCode: http.StatusInternalServerError,
-		Error: dto.OpenAIError{
-			Message: fmt.Sprintf("%s", err.Error()),
-		},
+func doAwsClientRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor, requestBody io.Reader) (any, error) {
+	awsCli, err := newAwsClient(c, info)
+	if err != nil {
+		return nil, types.NewError(err, types.ErrorCodeChannelAwsClientError)
+	}
+	a.AwsClient = awsCli
+
+	// 获取对应的AWS模型ID
+	awsModelId := getAwsModelID(info.UpstreamModelName)
+
+	awsRegionPrefix := getAwsRegionPrefix(awsCli.Options().Region)
+	canCrossRegion := awsModelCanCrossRegion(awsModelId, awsRegionPrefix)
+	if canCrossRegion {
+		awsModelId = awsModelCrossRegion(awsModelId, awsRegionPrefix)
+	}
+
+	// init empty request.header
+	requestHeader := http.Header{}
+	a.SetupRequestHeader(c, &requestHeader, info)
+	headerOverride, err := channel.ResolveHeaderOverride(info, c)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range headerOverride {
+		requestHeader.Set(key, value)
+	}
+
+	if isNovaModel(awsModelId) {
+		var novaReq *NovaRequest
+		err = common.DecodeJson(requestBody, &novaReq)
+		if err != nil {
+			return nil, types.NewError(errors.Wrap(err, "decode nova request fail"), types.ErrorCodeBadRequestBody)
+		}
+
+		// 使用InvokeModel API，但使用Nova格式的请求体
+		awsReq := &bedrockruntime.InvokeModelInput{
+			ModelId:     aws.String(awsModelId),
+			Accept:      aws.String("application/json"),
+			ContentType: aws.String("application/json"),
+		}
+
+		reqBody, err := common.Marshal(novaReq)
+		if err != nil {
+			return nil, types.NewError(errors.Wrap(err, "marshal nova request"), types.ErrorCodeBadResponseBody)
+		}
+		awsReq.Body = reqBody
+		a.AwsReq = awsReq
+		return nil, nil
+	} else {
+		awsClaudeReq, err := formatRequest(requestBody, requestHeader)
+		if err != nil {
+			return nil, types.NewError(errors.Wrap(err, "format aws request fail"), types.ErrorCodeBadRequestBody)
+		}
+
+		if info.IsStream {
+			awsReq := &bedrockruntime.InvokeModelWithResponseStreamInput{
+				ModelId:     aws.String(awsModelId),
+				Accept:      aws.String("application/json"),
+				ContentType: aws.String("application/json"),
+			}
+			awsReq.Body, err = buildAwsRequestBody(c, info, awsClaudeReq)
+			if err != nil {
+				return nil, types.NewError(errors.Wrap(err, "marshal aws request fail"), types.ErrorCodeBadRequestBody)
+			}
+			a.AwsReq = awsReq
+			return nil, nil
+		} else {
+			awsReq := &bedrockruntime.InvokeModelInput{
+				ModelId:     aws.String(awsModelId),
+				Accept:      aws.String("application/json"),
+				ContentType: aws.String("application/json"),
+			}
+			awsReq.Body, err = buildAwsRequestBody(c, info, awsClaudeReq)
+			if err != nil {
+				return nil, types.NewError(errors.Wrap(err, "marshal aws request fail"), types.ErrorCodeBadRequestBody)
+			}
+			a.AwsReq = awsReq
+			return nil, nil
+		}
 	}
 }
 
-func awsRegionPrefix(awsRegionId string) string {
+// buildAwsRequestBody prepares the payload for AWS requests, applying passthrough rules when enabled.
+func buildAwsRequestBody(c *gin.Context, info *relaycommon.RelayInfo, awsClaudeReq any) ([]byte, error) {
+	if model_setting.GetGlobalSettings().PassThroughRequestEnabled || info.ChannelSetting.PassThroughBodyEnabled {
+		storage, err := common.GetBodyStorage(c)
+		if err != nil {
+			return nil, errors.Wrap(err, "get request body for pass-through fail")
+		}
+		body, err := storage.Bytes()
+		if err != nil {
+			return nil, errors.Wrap(err, "get request body bytes fail")
+		}
+		var data map[string]interface{}
+		if err := common.Unmarshal(body, &data); err != nil {
+			return nil, errors.Wrap(err, "pass-through unmarshal request body fail")
+		}
+		delete(data, "model")
+		delete(data, "stream")
+		return common.Marshal(data)
+	}
+	return common.Marshal(awsClaudeReq)
+}
+
+func getAwsRegionPrefix(awsRegionId string) string {
 	parts := strings.Split(awsRegionId, "-")
 	regionPrefix := ""
 	if len(parts) > 0 {
@@ -80,60 +214,22 @@ func awsModelCrossRegion(awsModelId, awsRegionPrefix string) string {
 	return modelPrefix + "." + awsModelId
 }
 
-func awsModelID(requestModel string) string {
-	if awsModelID, ok := awsModelIDMap[requestModel]; ok {
-		return awsModelID
+func getAwsModelID(requestModel string) string {
+	if awsModelIDName, ok := awsModelIDMap[requestModel]; ok {
+		return awsModelIDName
 	}
-
 	return requestModel
 }
 
-func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, requestMode int) (*types.NewAPIError, *dto.Usage) {
-	awsCli, err := newAwsClient(c, info)
+func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+
+	ctx, cancel := newAwsInvokeContext()
+	defer cancel()
+
+	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
 	if err != nil {
-		return types.NewError(err, types.ErrorCodeChannelAwsClientError), nil
-	}
-
-	awsModelId := awsModelID(c.GetString("request_model"))
-	// 检查是否为Nova模型
-	isNova, _ := c.Get("is_nova_model")
-	if isNova == true {
-		// Nova模型也支持跨区域
-		awsRegionPrefix := awsRegionPrefix(awsCli.Options().Region)
-		canCrossRegion := awsModelCanCrossRegion(awsModelId, awsRegionPrefix)
-		if canCrossRegion {
-			awsModelId = awsModelCrossRegion(awsModelId, awsRegionPrefix)
-		}
-		return handleNovaRequest(c, awsCli, info, awsModelId)
-	}
-
-	// 原有的Claude处理逻辑
-	awsRegionPrefix := awsRegionPrefix(awsCli.Options().Region)
-	canCrossRegion := awsModelCanCrossRegion(awsModelId, awsRegionPrefix)
-	if canCrossRegion {
-		awsModelId = awsModelCrossRegion(awsModelId, awsRegionPrefix)
-	}
-
-	awsReq := &bedrockruntime.InvokeModelInput{
-		ModelId:     aws.String(awsModelId),
-		Accept:      aws.String("application/json"),
-		ContentType: aws.String("application/json"),
-	}
-
-	claudeReq_, ok := c.Get("converted_request")
-	if !ok {
-		return types.NewError(errors.New("aws claude request not found"), types.ErrorCodeInvalidRequest), nil
-	}
-	claudeReq := claudeReq_.(*dto.ClaudeRequest)
-	awsClaudeReq := copyRequest(claudeReq)
-	awsReq.Body, err = common.Marshal(awsClaudeReq)
-	if err != nil {
-		return types.NewError(errors.Wrap(err, "marshal request"), types.ErrorCodeBadResponseBody), nil
-	}
-
-	awsResp, err := awsCli.InvokeModel(c.Request.Context(), awsReq)
-	if err != nil {
-		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, http.StatusInternalServerError), nil
+		statusCode := getAwsErrorStatusCode(err)
+		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode), nil
 	}
 
 	claudeInfo := &claude.ClaudeResponseInfo{
@@ -149,48 +245,21 @@ func awsHandler(c *gin.Context, info *relaycommon.RelayInfo, requestMode int) (*
 		c.Writer.Header().Set("Content-Type", *awsResp.ContentType)
 	}
 
-	handlerErr := claude.HandleClaudeResponseData(c, info, claudeInfo, nil, awsResp.Body, RequestModeMessage)
+	handlerErr := claude.HandleClaudeResponseData(c, info, claudeInfo, nil, awsResp.Body)
 	if handlerErr != nil {
 		return handlerErr, nil
 	}
 	return nil, claudeInfo.Usage
 }
 
-func awsStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo, requestMode int) (*types.NewAPIError, *dto.Usage) {
-	awsCli, err := newAwsClient(c, info)
+func awsStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
+	ctx, cancel := newAwsInvokeContext()
+	defer cancel()
+
+	awsResp, err := a.AwsClient.InvokeModelWithResponseStream(ctx, a.AwsReq.(*bedrockruntime.InvokeModelWithResponseStreamInput))
 	if err != nil {
-		return types.NewError(err, types.ErrorCodeChannelAwsClientError), nil
-	}
-
-	awsModelId := awsModelID(c.GetString("request_model"))
-
-	awsRegionPrefix := awsRegionPrefix(awsCli.Options().Region)
-	canCrossRegion := awsModelCanCrossRegion(awsModelId, awsRegionPrefix)
-	if canCrossRegion {
-		awsModelId = awsModelCrossRegion(awsModelId, awsRegionPrefix)
-	}
-
-	awsReq := &bedrockruntime.InvokeModelWithResponseStreamInput{
-		ModelId:     aws.String(awsModelId),
-		Accept:      aws.String("application/json"),
-		ContentType: aws.String("application/json"),
-	}
-
-	claudeReq_, ok := c.Get("converted_request")
-	if !ok {
-		return types.NewError(errors.New("aws claude request not found"), types.ErrorCodeInvalidRequest), nil
-	}
-	claudeReq := claudeReq_.(*dto.ClaudeRequest)
-
-	awsClaudeReq := copyRequest(claudeReq)
-	awsReq.Body, err = common.Marshal(awsClaudeReq)
-	if err != nil {
-		return types.NewError(errors.Wrap(err, "marshal request"), types.ErrorCodeBadResponseBody), nil
-	}
-
-	awsResp, err := awsCli.InvokeModelWithResponseStream(c.Request.Context(), awsReq)
-	if err != nil {
-		return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, http.StatusInternalServerError), nil
+		statusCode := getAwsErrorStatusCode(err)
+		return types.NewOpenAIError(errors.Wrap(err, "InvokeModelWithResponseStream"), types.ErrorCodeAwsInvokeError, statusCode), nil
 	}
 	stream := awsResp.GetStream()
 	defer stream.Close()
@@ -207,7 +276,7 @@ func awsStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		switch v := event.(type) {
 		case *bedrockruntimeTypes.ResponseStreamMemberChunk:
 			info.SetFirstResponseTime()
-			respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes), RequestModeMessage)
+			respErr := claude.HandleStreamResponseData(c, info, claudeInfo, string(v.Value.Bytes))
 			if respErr != nil {
 				return respErr, nil
 			}
@@ -220,34 +289,20 @@ func awsStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.Rel
 		}
 	}
 
-	claude.HandleStreamFinalResponse(c, info, claudeInfo, RequestModeMessage)
+	claude.HandleStreamFinalResponse(c, info, claudeInfo)
 	return nil, claudeInfo.Usage
 }
 
 // Nova模型处理函数
-func handleNovaRequest(c *gin.Context, awsCli *bedrockruntime.Client, info *relaycommon.RelayInfo, awsModelId string) (*types.NewAPIError, *dto.Usage) {
-	novaReq_, ok := c.Get("converted_request")
-	if !ok {
-		return types.NewError(errors.New("nova request not found"), types.ErrorCodeInvalidRequest), nil
-	}
-	novaReq := novaReq_.(*NovaRequest)
+func handleNovaRequest(c *gin.Context, info *relaycommon.RelayInfo, a *Adaptor) (*types.NewAPIError, *dto.Usage) {
 
-	// 使用InvokeModel API，但使用Nova格式的请求体
-	awsReq := &bedrockruntime.InvokeModelInput{
-		ModelId:     aws.String(awsModelId),
-		Accept:      aws.String("application/json"),
-		ContentType: aws.String("application/json"),
-	}
+	ctx, cancel := newAwsInvokeContext()
+	defer cancel()
 
-	reqBody, err := json.Marshal(novaReq)
+	awsResp, err := a.AwsClient.InvokeModel(ctx, a.AwsReq.(*bedrockruntime.InvokeModelInput))
 	if err != nil {
-		return types.NewError(errors.Wrap(err, "marshal nova request"), types.ErrorCodeBadResponseBody), nil
-	}
-	awsReq.Body = reqBody
-
-	awsResp, err := awsCli.InvokeModel(c.Request.Context(), awsReq)
-	if err != nil {
-		return types.NewError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeChannelAwsClientError), nil
+		statusCode := getAwsErrorStatusCode(err)
+		return types.NewOpenAIError(errors.Wrap(err, "InvokeModel"), types.ErrorCodeAwsInvokeError, statusCode), nil
 	}
 
 	// 解析Nova响应

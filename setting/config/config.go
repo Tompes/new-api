@@ -131,6 +131,18 @@ func configToMap(config interface{}) (map[string]string, error) {
 			strValue = strconv.FormatUint(field.Uint(), 10)
 		case reflect.Float32, reflect.Float64:
 			strValue = strconv.FormatFloat(field.Float(), 'f', -1, 64)
+		case reflect.Ptr:
+			// 处理指针类型：如果非 nil，序列化指向的值
+			if !field.IsNil() {
+				bytes, err := json.Marshal(field.Interface())
+				if err != nil {
+					return nil, err
+				}
+				strValue = string(bytes)
+			} else {
+				// nil 指针序列化为 "null"
+				strValue = "null"
+			}
 		case reflect.Map, reflect.Slice, reflect.Struct:
 			// 复杂类型使用JSON序列化
 			bytes, err := json.Marshal(field.Interface())
@@ -200,13 +212,23 @@ func updateConfigFromMap(config interface{}, configMap map[string]string) error 
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			intValue, err := strconv.ParseInt(strValue, 10, 64)
 			if err != nil {
-				continue
+				// 兼容 float 格式的字符串（如 "2.000000"）
+				floatValue, fErr := strconv.ParseFloat(strValue, 64)
+				if fErr != nil {
+					continue
+				}
+				intValue = int64(floatValue)
 			}
 			field.SetInt(intValue)
 		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 			uintValue, err := strconv.ParseUint(strValue, 10, 64)
 			if err != nil {
-				continue
+				// 兼容 float 格式的字符串
+				floatValue, fErr := strconv.ParseFloat(strValue, 64)
+				if fErr != nil || floatValue < 0 {
+					continue
+				}
+				uintValue = uint64(floatValue)
 			}
 			field.SetUint(uintValue)
 		case reflect.Float32, reflect.Float64:
@@ -215,8 +237,31 @@ func updateConfigFromMap(config interface{}, configMap map[string]string) error 
 				continue
 			}
 			field.SetFloat(floatValue)
-		case reflect.Map, reflect.Slice, reflect.Struct:
-			// 复杂类型使用JSON反序列化
+		case reflect.Ptr:
+			// 处理指针类型
+			if strValue == "null" {
+				field.Set(reflect.Zero(field.Type()))
+			} else {
+				// 如果指针是 nil，需要先初始化
+				if field.IsNil() {
+					field.Set(reflect.New(field.Type().Elem()))
+				}
+				// 反序列化到指针指向的值
+				err := json.Unmarshal([]byte(strValue), field.Interface())
+				if err != nil {
+					continue
+				}
+			}
+		case reflect.Map:
+			// json.Unmarshal merges into existing maps (keeps old keys that are
+			// absent from the new JSON). Allocate a fresh map so removed keys
+			// are properly cleared.
+			fresh := reflect.New(field.Type())
+			if err := json.Unmarshal([]byte(strValue), fresh.Interface()); err != nil {
+				continue
+			}
+			field.Set(fresh.Elem())
+		case reflect.Slice, reflect.Struct:
 			err := json.Unmarshal([]byte(strValue), field.Addr().Interface())
 			if err != nil {
 				continue

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/types"
 )
 
@@ -220,16 +221,23 @@ type CompletionsStreamResponse struct {
 }
 
 type Usage struct {
-	PromptTokens         int `json:"prompt_tokens"`
-	CompletionTokens     int `json:"completion_tokens"`
-	TotalTokens          int `json:"total_tokens"`
-	PromptCacheHitTokens int `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptTokens         int    `json:"prompt_tokens"`
+	CompletionTokens     int    `json:"completion_tokens"`
+	TotalTokens          int    `json:"total_tokens"`
+	PromptCacheHitTokens int    `json:"prompt_cache_hit_tokens,omitempty"`
+	UsageSemantic        string `json:"usage_semantic,omitempty"`
+	UsageSource          string `json:"usage_source,omitempty"`
 
 	PromptTokensDetails    InputTokenDetails  `json:"prompt_tokens_details"`
 	CompletionTokenDetails OutputTokenDetails `json:"completion_tokens_details"`
 	InputTokens            int                `json:"input_tokens"`
 	OutputTokens           int                `json:"output_tokens"`
 	InputTokensDetails     *InputTokenDetails `json:"input_tokens_details"`
+
+	// claude cache 1h
+	ClaudeCacheCreation5mTokens int `json:"claude_cache_creation_5_m_tokens"`
+	ClaudeCacheCreation1hTokens int `json:"claude_cache_creation_1_h_tokens"`
+
 	// OpenRouter Params
 	Cost any `json:"cost,omitempty"`
 }
@@ -246,7 +254,7 @@ type OpenAIVideoResponse struct {
 
 type InputTokenDetails struct {
 	CachedTokens         int `json:"cached_tokens"`
-	CachedCreationTokens int `json:"-"`
+	CachedCreationTokens int `json:"cached_creation_tokens,omitempty"`
 	TextTokens           int `json:"text_tokens"`
 	AudioTokens          int `json:"audio_tokens"`
 	ImageTokens          int `json:"image_tokens"`
@@ -255,6 +263,7 @@ type InputTokenDetails struct {
 type OutputTokenDetails struct {
 	TextTokens      int `json:"text_tokens"`
 	AudioTokens     int `json:"audio_tokens"`
+	ImageTokens     int `json:"image_tokens"`
 	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
@@ -262,22 +271,22 @@ type OpenAIResponsesResponse struct {
 	ID                 string             `json:"id"`
 	Object             string             `json:"object"`
 	CreatedAt          int                `json:"created_at"`
-	Status             string             `json:"status"`
+	Status             json.RawMessage    `json:"status"`
 	Error              any                `json:"error,omitempty"`
 	IncompleteDetails  *IncompleteDetails `json:"incomplete_details,omitempty"`
-	Instructions       string             `json:"instructions"`
+	Instructions       json.RawMessage    `json:"instructions"`
 	MaxOutputTokens    int                `json:"max_output_tokens"`
 	Model              string             `json:"model"`
 	Output             []ResponsesOutput  `json:"output"`
 	ParallelToolCalls  bool               `json:"parallel_tool_calls"`
-	PreviousResponseID string             `json:"previous_response_id"`
+	PreviousResponseID json.RawMessage    `json:"previous_response_id"`
 	Reasoning          *Reasoning         `json:"reasoning"`
 	Store              bool               `json:"store"`
 	Temperature        float64            `json:"temperature"`
-	ToolChoice         string             `json:"tool_choice"`
+	ToolChoice         json.RawMessage    `json:"tool_choice"`
 	Tools              []map[string]any   `json:"tools"`
 	TopP               float64            `json:"top_p"`
-	Truncation         string             `json:"truncation"`
+	Truncation         json.RawMessage    `json:"truncation"`
 	Usage              *Usage             `json:"usage"`
 	User               json.RawMessage    `json:"user"`
 	Metadata           json.RawMessage    `json:"metadata"`
@@ -329,19 +338,40 @@ type IncompleteDetails struct {
 }
 
 type ResponsesOutput struct {
-	Type    string                   `json:"type"`
-	ID      string                   `json:"id"`
-	Status  string                   `json:"status"`
-	Role    string                   `json:"role"`
-	Content []ResponsesOutputContent `json:"content"`
-	Quality string                   `json:"quality"`
-	Size    string                   `json:"size"`
+	Type      string                   `json:"type"`
+	ID        string                   `json:"id"`
+	Status    string                   `json:"status"`
+	Role      string                   `json:"role"`
+	Content   []ResponsesOutputContent `json:"content"`
+	Quality   string                   `json:"quality"`
+	Size      string                   `json:"size"`
+	CallId    string                   `json:"call_id,omitempty"`
+	Name      string                   `json:"name,omitempty"`
+	Arguments json.RawMessage          `json:"arguments,omitempty"`
+}
+
+// ArgumentsString returns function call arguments in the string form expected by Chat Completions.
+func (r *ResponsesOutput) ArgumentsString() string {
+	if r == nil {
+		return ""
+	}
+	return ResponsesArgumentsString(r.Arguments)
+}
+
+// ResponsesArgumentsString returns function call arguments in the string form expected by Chat Completions.
+func ResponsesArgumentsString(arguments json.RawMessage) string {
+	return common.JsonRawMessageToString(arguments)
 }
 
 type ResponsesOutputContent struct {
 	Type        string        `json:"type"`
 	Text        string        `json:"text"`
 	Annotations []interface{} `json:"annotations"`
+}
+
+type ResponsesReasoningSummaryPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 const (
@@ -364,6 +394,13 @@ type ResponsesStreamResponse struct {
 	Response *OpenAIResponsesResponse `json:"response,omitempty"`
 	Delta    string                   `json:"delta,omitempty"`
 	Item     *ResponsesOutput         `json:"item,omitempty"`
+	// - response.function_call_arguments.delta
+	// - response.function_call_arguments.done
+	OutputIndex  *int                           `json:"output_index,omitempty"`
+	ContentIndex *int                           `json:"content_index,omitempty"`
+	SummaryIndex *int                           `json:"summary_index,omitempty"`
+	ItemID       string                         `json:"item_id,omitempty"`
+	Part         *ResponsesReasoningSummaryPart `json:"part,omitempty"`
 }
 
 // GetOpenAIError 从动态错误类型中提取OpenAIError结构

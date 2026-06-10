@@ -57,6 +57,12 @@ func invalidateUserCache(userId int) error {
 	return common.RedisDelKey(getUserCacheKey(userId))
 }
 
+// InvalidateUserCache is the exported version of invalidateUserCache.
+// 供 controller 等上层包在用户状态变更（如禁用、删除、角色变更）后主动清理缓存。
+func InvalidateUserCache(userId int) error {
+	return invalidateUserCache(userId)
+}
+
 // updateUserCache updates all user cache fields using hash
 func updateUserCache(user User) error {
 	if !common.RedisEnabled {
@@ -204,6 +210,10 @@ func updateUserGroupCache(userId int, group string) error {
 	return common.RedisHSetField(getUserCacheKey(userId), "Group", group)
 }
 
+func UpdateUserGroupCache(userId int, group string) error {
+	return updateUserGroupCache(userId, group)
+}
+
 func updateUserNameCache(userId int, username string) error {
 	if !common.RedisEnabled {
 		return nil
@@ -216,4 +226,14 @@ func updateUserSettingCache(userId int, setting string) error {
 		return nil
 	}
 	return common.RedisHSetField(getUserCacheKey(userId), "Setting", setting)
+}
+
+// GetUserLanguage returns the user's language preference from cache
+// Uses the existing GetUserCache mechanism for efficiency
+func GetUserLanguage(userId int) string {
+	userCache, err := GetUserCache(userId)
+	if err != nil {
+		return ""
+	}
+	return userCache.GetSetting().Language
 }

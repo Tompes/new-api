@@ -2,6 +2,7 @@ package model
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/QuantumNous/new-api/common"
 
@@ -47,7 +48,21 @@ func (mi *Model) Insert() error {
 	now := common.GetTimestamp()
 	mi.CreatedTime = now
 	mi.UpdatedTime = now
-	return DB.Create(mi).Error
+
+	// 保存原始值（因为 Create 后可能被 GORM 的 default 标签覆盖为 1）
+	originalStatus := mi.Status
+	originalSyncOfficial := mi.SyncOfficial
+
+	// 先创建记录（GORM 会对零值字段应用默认值）
+	if err := DB.Create(mi).Error; err != nil {
+		return err
+	}
+
+	// 使用保存的原始值进行更新，确保零值能正确保存
+	return DB.Model(&Model{}).Where("id = ?", mi.Id).Updates(map[string]interface{}{
+		"status":        originalStatus,
+		"sync_official": originalSyncOfficial,
+	}).Error
 }
 
 func IsModelNameDuplicated(id int, name string) (bool, error) {
@@ -61,11 +76,9 @@ func IsModelNameDuplicated(id int, name string) (bool, error) {
 
 func (mi *Model) Update() error {
 	mi.UpdatedTime = common.GetTimestamp()
-	return DB.Session(&gorm.Session{AllowGlobalUpdate: false, FullSaveAssociations: false}).
-		Model(&Model{}).
-		Where("id = ?", mi.Id).
-		Omit("created_time").
-		Select("*").
+	// 使用 Select 强制更新所有字段，包括零值
+	return DB.Model(&Model{}).Where("id = ?", mi.Id).
+		Select("model_name", "description", "icon", "tags", "vendor_id", "endpoints", "status", "sync_official", "name_rule", "updated_time").
 		Updates(mi).Error
 }
 
@@ -119,6 +132,62 @@ func GetBoundChannelsByModelsMap(modelNames []string) (map[string][]BoundChannel
 	}
 	for _, r := range rows {
 		result[r.Model] = append(result[r.Model], BoundChannel{Name: r.Name, Type: r.Type})
+	}
+	return result, nil
+}
+
+func normalizeLookupValues(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
+func GetPreferredModelOwnerChannelTypes(modelNames []string, groups []string) (map[string]int, error) {
+	result := make(map[string]int)
+	modelNames = normalizeLookupValues(modelNames)
+	if len(modelNames) == 0 {
+		return result, nil
+	}
+
+	type row struct {
+		Model       string
+		ChannelType int
+	}
+	var rows []row
+
+	query := DB.Table("abilities").
+		Select("abilities.model as model, channels.type as channel_type").
+		Joins("JOIN channels ON abilities.channel_id = channels.id").
+		Where("abilities.model IN ? AND abilities.enabled = ? AND channels.status = ?", modelNames, true, common.ChannelStatusEnabled).
+		Order("COALESCE(abilities.priority, 0) DESC").
+		Order("abilities.weight DESC").
+		Order("abilities.channel_id ASC")
+
+	groups = normalizeLookupValues(groups)
+	if len(groups) > 0 {
+		query = query.Where("abilities."+commonGroupCol+" IN ?", groups)
+	}
+
+	if err := query.Scan(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	for _, r := range rows {
+		if _, ok := result[r.Model]; ok {
+			continue
+		}
+		result[r.Model] = r.ChannelType
 	}
 	return result, nil
 }

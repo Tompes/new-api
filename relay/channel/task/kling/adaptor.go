@@ -2,17 +2,17 @@ package kling
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 
-	"github.com/bytedance/gopkg/util/logger"
 	"github.com/samber/lo"
 
 	"github.com/gin-gonic/gin"
@@ -22,6 +22,7 @@ import (
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/relay/channel"
+	taskcommon "github.com/QuantumNous/new-api/relay/channel/task/taskcommon"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 )
@@ -81,15 +82,28 @@ type responsePayload struct {
 		TaskId        string `json:"task_id"`
 		TaskStatus    string `json:"task_status"`
 		TaskStatusMsg string `json:"task_status_msg"`
-		TaskResult    struct {
+		TaskInfo      struct {
+			ExternalTaskId string `json:"external_task_id"`
+		} `json:"task_info"`
+		WatermarkInfo struct {
+			Enabled bool `json:"enabled"`
+		} `json:"watermark_info"`
+		TaskResult struct {
 			Videos []struct {
-				Id       string `json:"id"`
-				Url      string `json:"url"`
-				Duration string `json:"duration"`
+				Id           string `json:"id"`
+				Url          string `json:"url"`
+				WatermarkUrl string `json:"watermark_url"`
+				Duration     string `json:"duration"`
 			} `json:"videos"`
+			Images []struct {
+				Index        int    `json:"index"`
+				Url          string `json:"url"`
+				WatermarkUrl string `json:"watermark_url"`
+			} `json:"images"`
 		} `json:"task_result"`
-		CreatedAt int64 `json:"created_at"`
-		UpdatedAt int64 `json:"updated_at"`
+		CreatedAt          int64  `json:"created_at"`
+		UpdatedAt          int64  `json:"updated_at"`
+		FinalUnitDeduction string `json:"final_unit_deduction"`
 	} `json:"data"`
 }
 
@@ -98,6 +112,7 @@ type responsePayload struct {
 // ============================
 
 type TaskAdaptor struct {
+	taskcommon.BaseBilling
 	ChannelType int
 	apiKey      string
 	baseURL     string
@@ -150,14 +165,14 @@ func (a *TaskAdaptor) BuildRequestBody(c *gin.Context, info *relaycommon.RelayIn
 	}
 	req := v.(relaycommon.TaskSubmitReq)
 
-	body, err := a.convertToRequestPayload(&req)
+	body, err := a.convertToRequestPayload(&req, info)
 	if err != nil {
 		return nil, err
 	}
 	if body.Image == "" && body.ImageTail == "" {
 		c.Set("action", constant.TaskActionTextGenerate)
 	}
-	data, err := json.Marshal(body)
+	data, err := common.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
@@ -181,22 +196,26 @@ func (a *TaskAdaptor) DoResponse(c *gin.Context, resp *http.Response, info *rela
 	}
 
 	var kResp responsePayload
-	err = json.Unmarshal(responseBody, &kResp)
+	err = common.Unmarshal(responseBody, &kResp)
 	if err != nil {
 		taskErr = service.TaskErrorWrapper(err, "unmarshal_response_failed", http.StatusInternalServerError)
 		return
 	}
 	if kResp.Code != 0 {
-		taskErr = service.TaskErrorWrapperLocal(fmt.Errorf(kResp.Message), "task_failed", http.StatusBadRequest)
+		taskErr = service.TaskErrorWrapperLocal(fmt.Errorf("%s", kResp.Message), "task_failed", http.StatusBadRequest)
 		return
 	}
-	kResp.TaskId = kResp.Data.TaskId
-	c.JSON(http.StatusOK, kResp)
+	ov := dto.NewOpenAIVideo()
+	ov.ID = info.PublicTaskID
+	ov.TaskID = info.PublicTaskID
+	ov.CreatedAt = time.Now().Unix()
+	ov.Model = info.OriginModelName
+	c.JSON(http.StatusOK, ov)
 	return kResp.Data.TaskId, responseBody, nil
 }
 
 // FetchTask fetch task status
-func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any) (*http.Response, error) {
+func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any, proxy string) (*http.Response, error) {
 	taskID, ok := body["task_id"].(string)
 	if !ok {
 		return nil, fmt.Errorf("invalid task_id")
@@ -225,7 +244,11 @@ func (a *TaskAdaptor) FetchTask(baseUrl, key string, body map[string]any) (*http
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "kling-sdk/1.0")
 
-	return service.GetHttpClient().Do(req)
+	client, err := service.GetHttpClientWithProxy(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("new proxy http client failed: %w", err)
+	}
+	return client.Do(req)
 }
 
 func (a *TaskAdaptor) GetModelList() []string {
@@ -240,15 +263,15 @@ func (a *TaskAdaptor) GetChannelName() string {
 // helpers
 // ============================
 
-func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*requestPayload, error) {
+func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq, info *relaycommon.RelayInfo) (*requestPayload, error) {
 	r := requestPayload{
 		Prompt:         req.Prompt,
 		Image:          req.Image,
-		Mode:           defaultString(req.Mode, "std"),
-		Duration:       fmt.Sprintf("%d", defaultInt(req.Duration, 5)),
+		Mode:           taskcommon.DefaultString(req.Mode, "std"),
+		Duration:       fmt.Sprintf("%d", taskcommon.DefaultInt(req.Duration, 5)),
 		AspectRatio:    a.getAspectRatio(req.Size),
-		ModelName:      req.Model,
-		Model:          req.Model, // Keep consistent with model_name, double writing improves compatibility
+		ModelName:      info.UpstreamModelName,
+		Model:          info.UpstreamModelName,
 		CfgScale:       0.5,
 		StaticMask:     "",
 		DynamicMasks:   []DynamicMask{},
@@ -258,14 +281,9 @@ func (a *TaskAdaptor) convertToRequestPayload(req *relaycommon.TaskSubmitReq) (*
 	}
 	if r.ModelName == "" {
 		r.ModelName = "kling-v1"
+		r.Model = "kling-v1"
 	}
-	metadata := req.Metadata
-	medaBytes, err := json.Marshal(metadata)
-	if err != nil {
-		return nil, errors.Wrap(err, "metadata marshal metadata failed")
-	}
-	err = json.Unmarshal(medaBytes, &r)
-	if err != nil {
+	if err := taskcommon.UnmarshalMetadata(req.Metadata, &r); err != nil {
 		return nil, errors.Wrap(err, "unmarshal metadata failed")
 	}
 	return &r, nil
@@ -282,20 +300,6 @@ func (a *TaskAdaptor) getAspectRatio(size string) string {
 	default:
 		return "1:1"
 	}
-}
-
-func defaultString(s, def string) string {
-	if strings.TrimSpace(s) == "" {
-		return def
-	}
-	return s
-}
-
-func defaultInt(v int, def int) int {
-	if v == 0 {
-		return def
-	}
-	return v
 }
 
 // ============================
@@ -333,13 +337,13 @@ func (a *TaskAdaptor) createJWTTokenWithKey(apiKey string) (string, error) {
 func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, error) {
 	taskInfo := &relaycommon.TaskInfo{}
 	resPayload := responsePayload{}
-	err := json.Unmarshal(respBody, &resPayload)
+	err := common.Unmarshal(respBody, &resPayload)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal response body")
 	}
 	taskInfo.Code = resPayload.Code
 	taskInfo.TaskID = resPayload.Data.TaskId
-	taskInfo.Reason = resPayload.Message
+	taskInfo.Reason = resPayload.Data.TaskStatusMsg
 	//任务状态，枚举值：submitted（已提交）、processing（处理中）、succeed（成功）、failed（失败）
 	status := resPayload.Data.TaskStatus
 	switch status {
@@ -349,14 +353,21 @@ func (a *TaskAdaptor) ParseTaskResult(respBody []byte) (*relaycommon.TaskInfo, e
 		taskInfo.Status = model.TaskStatusInProgress
 	case "succeed":
 		taskInfo.Status = model.TaskStatusSuccess
+		if videos := resPayload.Data.TaskResult.Videos; len(videos) > 0 {
+			video := videos[0]
+			taskInfo.Url = video.Url
+		}
+		if tokens, err := strconv.ParseFloat(resPayload.Data.FinalUnitDeduction, 64); err == nil {
+			rounded := int(math.Ceil(tokens))
+			if rounded > 0 {
+				taskInfo.CompletionTokens = rounded
+				taskInfo.TotalTokens = rounded
+			}
+		}
 	case "failed":
 		taskInfo.Status = model.TaskStatusFailure
 	default:
 		return nil, fmt.Errorf("unknown task status: %s", status)
-	}
-	if videos := resPayload.Data.TaskResult.Videos; len(videos) > 0 {
-		video := videos[0]
-		taskInfo.Url = video.Url
 	}
 	return taskInfo, nil
 }
@@ -365,37 +376,23 @@ func isNewAPIRelay(apiKey string) bool {
 	return strings.HasPrefix(apiKey, "sk-")
 }
 
-func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) (*relaycommon.OpenAIVideo, error) {
+func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) ([]byte, error) {
 	var klingResp responsePayload
-	if err := json.Unmarshal(originTask.Data, &klingResp); err != nil {
+	if err := common.Unmarshal(originTask.Data, &klingResp); err != nil {
 		return nil, errors.Wrap(err, "unmarshal kling task data failed")
 	}
 
-	convertProgress := func(progress string) int {
-		progress = strings.TrimSuffix(progress, "%")
-		p, err := strconv.Atoi(progress)
-		if err != nil {
-			logger.Warnf("convert progress failed, progress: %s, err: %v", progress, err)
-		}
-		return p
-	}
+	openAIVideo := dto.NewOpenAIVideo()
+	openAIVideo.ID = originTask.TaskID
+	openAIVideo.Status = originTask.Status.ToVideoStatus()
+	openAIVideo.SetProgressStr(originTask.Progress)
+	openAIVideo.CreatedAt = klingResp.Data.CreatedAt
+	openAIVideo.CompletedAt = klingResp.Data.UpdatedAt
 
-	openAIVideo := &relaycommon.OpenAIVideo{
-		ID:     klingResp.Data.TaskId,
-		Object: "video",
-		//Model:       "kling-v1", //todo save model
-		Status:      string(originTask.Status),
-		CreatedAt:   klingResp.Data.CreatedAt,
-		CompletedAt: klingResp.Data.UpdatedAt,
-		Metadata:    make(map[string]any),
-		Progress:    convertProgress(originTask.Progress),
-	}
-
-	// 处理视频 URL
 	if len(klingResp.Data.TaskResult.Videos) > 0 {
 		video := klingResp.Data.TaskResult.Videos[0]
 		if video.Url != "" {
-			openAIVideo.Metadata["url"] = video.Url
+			openAIVideo.SetMetadata("url", video.Url)
 		}
 		if video.Duration != "" {
 			openAIVideo.Seconds = video.Duration
@@ -403,11 +400,17 @@ func (a *TaskAdaptor) ConvertToOpenAIVideo(originTask *model.Task) (*relaycommon
 	}
 
 	if klingResp.Code != 0 && klingResp.Message != "" {
-		openAIVideo.Error = &relaycommon.OpenAIVideoError{
+		openAIVideo.Error = &dto.OpenAIVideoError{
 			Message: klingResp.Message,
 			Code:    fmt.Sprintf("%d", klingResp.Code),
 		}
 	}
 
-	return openAIVideo, nil
+	// https://app.klingai.com/cn/dev/document-api/apiReference/model/textToVideo
+	if data := klingResp.Data; data.TaskStatus == "failed" {
+		openAIVideo.Error = &dto.OpenAIVideoError{
+			Message: data.TaskStatusMsg,
+		}
+	}
+	return common.Marshal(openAIVideo)
 }

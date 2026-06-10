@@ -1,12 +1,37 @@
 package controller
 
 import (
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
-	"github.com/QuantumNous/new-api/setting"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 
 	"github.com/gin-gonic/gin"
 )
+
+func filterPricingByUsableGroups(pricing []model.Pricing, usableGroup map[string]string) []model.Pricing {
+	if len(pricing) == 0 {
+		return pricing
+	}
+	if len(usableGroup) == 0 {
+		return []model.Pricing{}
+	}
+
+	filtered := make([]model.Pricing, 0, len(pricing))
+	for _, item := range pricing {
+		if common.StringsContains(item.EnableGroup, "all") {
+			filtered = append(filtered, item)
+			continue
+		}
+		for _, group := range item.EnableGroup {
+			if _, ok := usableGroup[group]; ok {
+				filtered = append(filtered, item)
+				break
+			}
+		}
+	}
+	return filtered
+}
 
 func GetPricing(c *gin.Context) {
 	pricing := model.GetPricing()
@@ -30,7 +55,8 @@ func GetPricing(c *gin.Context) {
 		}
 	}
 
-	usableGroup = setting.GetUserUsableGroups(group)
+	usableGroup = service.GetUserUsableGroups(group)
+	pricing = filterPricingByUsableGroups(pricing, usableGroup)
 	// check groupRatio contains usableGroup
 	for group := range ratio_setting.GetGroupRatioCopy() {
 		if _, ok := usableGroup[group]; !ok {
@@ -45,7 +71,8 @@ func GetPricing(c *gin.Context) {
 		"group_ratio":        groupRatio,
 		"usable_group":       usableGroup,
 		"supported_endpoint": model.GetSupportedEndpointMap(),
-		"auto_groups":        setting.AutoGroups,
+		"auto_groups":        service.GetUserAutoGroup(group),
+		"pricing_version":    "a42d372ccf0b5dd13ecf71203521f9d2",
 	})
 }
 
